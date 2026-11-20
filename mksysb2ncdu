@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""mksysb2ncdu - convert an AIX mksysb/savevg ("backup by name" format) to an ncdu JSON export.
+
+Usage:
+  mksysb2ncdu [options] [FILE|-] | ncdu -r -f-
+  ssh aix 'cat /mksysb/x.mksysb' | mksysb2ncdu | ncdu -r -f-
+  find . | backup -iqf - | mksysb2ncdu                (on AIX, no archive file needed)
+  mksysb2ncdu x.mksysb -o x.ncdu && ncdu -r -f x.ncdu
+
+Streams the input in a single pass: file data is skipped, nothing is unpacked.
+Also works on a whole tape image copied into one file (it searches for the start of the backup).
+No dependencies, Python >= 3.6 (runs on AIX too: /usr/bin/python3).
+
+Format notes (see /usr/include/dumprestor.h on AIX): headers are little-endian, every record
+starts with struct hdr (len in 8-byte dwords, type, magic 60011 or 60012 = packed, checksum).
+FS_NAME_X (11) / FS_NAME_LF (12, 64-bit sizes) / FS_NAME_E (15) describe a file; for types 11
+and 12 (except symlinks) a struct sac_rec plus ACL/PCL follows the header; then the file data
+(dsize bytes if packed, size bytes otherwise, padded to 8); FS_NAME_ACL (14) records carry
+typed ACLs. FS_END (7) ends the backup.
+"""
+import argparse
+import os
+import struct
+import sys
+import time
+
+MAGIC = 60011         # 0xea6b
+PACKED_MAGIC = 60012  # 0xea6c (Huffman pack)
+MAGICS = (MAGIC, PACKED_MAGIC)
+FS_VOLUME, FS_END, FS_VOLEND = 0, 7, 6
+FS_NAME_X, FS_NAME_LF, FS_NAME_ACL, FS_NAME_E = 11, 12, 14, 15
+NAME_TYPES = (FS_NAME_X, FS_NAME_LF, FS_NAME_E)
+S_IFMT, S_IFDIR, S_IFREG, S_IFLNK = 0o170000, 0o040000, 0o100000, 0o120000
+VOL_SIG = b'by name'
+
+
+class FormatError(Exception):
+    pass
+
+
+class Reader:
+    """Streaming reader with skipping (seek when possible, otherwise read and discard)."""
+
+    def __init__(self, f):
+        self.f = f
+        self.pos = 0
+        try:
+            self.seekable = f.seekable()
+        except Exception:
+            self.seekable = False
+        self.size = None
+        if self.seekable:
+            try:
+                self.size = os.fstat(f.fileno()).st_size
+                self.pos = f.tell()
+            except Exception:
+                self.seekable = False
+
+    def read(self, n):
+        out = bytearray()
+        while len(out) < n:
+            b = self.f.read(n - len(out))
+            if not b:
+                break
+            out += b
+        self.pos += len(out)
+        return bytes(out)
+
+    def skip(self, n):
+        if n <= 0:
+            return True
+        if self.seekable:
+            if self.size is not None and self.pos + n > self.size:
+                self.f.seek(0, os.SEEK_END)
+                self.pos = self.size
+                return False
+            self.f.seek(n, os.SEEK_CUR)
+            self.pos += n
+            return True
+        while n:
+            b = self.f.read(min(n, 1 << 20))
+            if not b:
+                return False
+            n -= len(b)
+            self.pos += len(b)
+        return True
+
+
+def find_volume(r, limit):
+    """Find the FS_VOLUME ("by name") header; return its 72 bytes, (header, rest) or None.
+    A tape image may have boot image / bosinst / toc in front of the backup."""
+    buf = r.read(72)
+    if len(buf) == 72 and is_volume(buf):
+        return buf
+    base = r.pos - len(buf)
+    while r.pos - base < limit:
+        chunk = r.read(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+        i = 0
+        while True:
+            i = buf.find(b'\x00\x6b\xea', i)
+            if i < 0 or i + 72 > len(buf):
+                break
+            j = i - 1
+            if j >= 0 and (base + j) % 8 == 0 and is_volume(buf[j:j + 72]):
+                rest = buf[j + 72:]
+                return buf[j:j + 72], rest
+            i += 1
+        keep = len(buf) - 72
+        if keep > 0:
+            keep -= keep % 8
+            base += keep
+            buf = buf[keep:]
+    return None
+
+
+def is_volume(h):
+    ln, typ, mag = struct.unpack_from('<BBH', h, 0)
+    return typ == FS_VOLUME and mag == MAGIC and ln == 9 and h[0x14:0x1b] == VOL_SIG
+
+
+class PreReader(Reader):
+    """Reader with pushed-back data (the buffer left over from the header search)."""
+
+    def __init__(self, r, pre):
+        self.r, self.pre = r, pre
+        self.pos = r.pos - len(pre)
+
+    def read(self, n):
+        if self.pre:
+            a, self.pre = self.pre[:n], self.pre[n:]
+            b = self.r.read(n - len(a)) if len(a) < n else b''
+            self.pos += len(a) + len(b)
+            return a + b
+        b = self.r.read(n)
+        self.pos += len(b)
+        return b
+
+    def skip(self, n):
+        if self.pre:
+            k = min(n, len(self.pre))
+            self.pre = self.pre[k:]
+            self.pos += k
+            n -= k
+        if n <= 0:
+            return True
+        p0 = self.r.pos
+        ok = self.r.skip(n)
+        self.pos += self.r.pos - p0
+        return ok
+
+
+class Node:
+    __slots__ = ('name', 'kids', 'meta')
+
+    def __init__(self, name):
+        self.name = name
+        self.kids = None   # dict of children for a directory
+        self.meta = None   # metadata from the backup header
+
+
+def parse(r, warn):
+    """Yield (name, mode, uid, gid, size, mtime, nlink, stored, ok) for every record."""
+    while True:
+        hp = r.pos
+        h = r.read(8)
+        if len(h) < 8:
+            if h:
+                warn('incomplete header at end of input (offset %d)' % hp)
+            return
+        ln, typ, mag = struct.unpack_from('<BBH', h, 0)
+        if mag not in MAGICS or ln == 0:
+            raise FormatError('invalid header at offset %d (%s)' % (hp, h.hex()))
+        h += r.read(ln * 8 - 8)
+        if len(h) < ln * 8:
+            warn('backup is truncated (offset %d)' % hp)
+            return
+        if typ in (FS_END, FS_VOLEND):
+            return
+        if typ == FS_VOLUME:
+            continue
+        if typ in (FS_NAME_LF, FS_NAME_E, FS_NAME_ACL) or typ > FS_NAME_ACL:
+            # 64-bit variants: size @0x18 (8 B), times @0x20.., dsize @0x40 (8 B), name @0x48
+            if len(h) < 0x48:
+                size, = struct.unpack_from('<q', h, 0x18)
+                dsize, mtime, name = size, 0, b''
+            else:
+                size, = struct.unpack_from('<q', h, 0x18)
+                mtime, = struct.unpack_from('<i', h, 0x24)
+                dsize, = struct.unpack_from('<q', h, 0x40)
+                name = h[0x48:]
+        elif typ == FS_NAME_X:
+            size, = struct.unpack_from('<i', h, 0x18)
+            mtime, = struct.unpack_from('<i', h, 0x20)
+            dsize, = struct.unpack_from('<i', h, 0x38)
+            name = h[0x40:]
+        else:
+            raise FormatError('unsupported record type %d at offset %d' % (typ, hp))
+        mode, uid, gid = struct.unpack_from('<III', h, 0x0c)
+        nlink, = struct.unpack_from('<h', h, 6)
+        acl = 0
+        if typ in (FS_NAME_X, FS_NAME_LF) and (mode & S_IFMT) != S_IFLNK:
+            sac = r.read(8)          # struct sac_rec: aclsize, pclsize (in dwords)
+            if len(sac) < 8:
+                warn('backup is truncated (offset %d)' % hp)
+                return
+            a, b = struct.unpack('<II', sac)
+            acl = 8 + 8 * (a + b)
+            if not r.skip(8 * (a + b)):
+                warn('backup is truncated (offset %d)' % hp)
+                return
+        dl = dsize if mag == PACKED_MAGIC else size
+        if dl < 0:
+            raise FormatError('negative data length at offset %d' % hp)
+        ok = r.skip((dl + 7) & ~7)
+        if typ in NAME_TYPES:
+            name = name.split(b'\0', 1)[0]
+            yield (name, mode, uid, gid, size, mtime, nlink, r.pos - hp, ok)
+        elif typ == FS_NAME_ACL:
+            yield (None, 0, 0, 0, 0, 0, 0, r.pos - hp, ok)   # added to the previous entry
+        if not ok:
+            warn('backup is truncated (offset %d)' % hp)
+            return
+
+
+def jstr(b):
+    """JSON string from raw bytes; non-ASCII bytes are kept as is (ncdu does the same)."""
+    out = bytearray(b'"')
+    for c in b:
+        if c == 0x22:
+            out += b'\\"'
+        elif c == 0x5c:
+            out += b'\\\\'
+        elif c < 0x20 or c == 0x7f:
+            out += b'\\u%04x' % c
+        else:
+            out.append(c)
+    out += b'"'
+    return bytes(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Convert an AIX mksysb/savevg (backup by name) to an ncdu JSON export.',
+        epilog='Example: mksysb2ncdu host.mksysb | ncdu -r -f-')
+    ap.add_argument('file', nargs='?', default='-', help='mksysb file or - for stdin (default)')
+    ap.add_argument('-o', '--output', default='-', help='output file (default stdout)')
+    ap.add_argument('--dsize', choices=('block', 'archive', 'apparent'), default='block',
+                    help='what to report as disk usage: block = size rounded up to --block (default), '
+                         'archive = space taken in the mksysb itself (after packing, with headers), '
+                         'apparent = file size')
+    ap.add_argument('--block', type=int, default=4096, help='block size for --dsize=block (default 4096, JFS2)')
+    ap.add_argument('--root', default=None, help='name of the root directory shown in ncdu (default /, e.g. /data for a savevg)')
+    ap.add_argument('--scan', type=int, default=256, metavar='MB',
+                    help='how many MB to search for the start of the backup (tape image), default 256')
+    ap.add_argument('-q', '--quiet', action='store_true', help='no progress or warnings on stderr')
+    a = ap.parse_args()
+
+    warned = []
+
+    def warn(msg):
+        warned.append(msg)
+        if not a.quiet:
+            sys.stderr.write('mksysb2ncdu: %s\n' % msg)
+
+    f = sys.stdin.buffer if a.file == '-' else open(a.file, 'rb')
+    r = Reader(f)
+    res = find_volume(r, a.scan << 20)
+    if res is None:
+        sys.exit('mksysb2ncdu: no "backup by name" header found (not a mksysb/savevg?)')
+    if isinstance(res, tuple):
+        vol, pre = res
+        r = PreReader(r, pre)
+        warn('start of backup found at offset %d' % (r.pos - 72))
+    else:
+        vol = res
+    vdate, = struct.unpack_from('<i', vol, 8)
+
+    root = Node(b'/')
+    root.kids = {}
+    last = None
+    n = 0
+    t0 = time.time()
+    tick = t0
+    try:
+        for (name, mode, uid, gid, size, mtime, nlink, stored, ok) in parse(r, warn):
+            if name is None:
+                if last is not None and last.meta is not None:
+                    last.meta['stored'] += stored
+                continue
+            n += 1
+            parts = [p for p in name.split(b'/') if p not in (b'', b'.')]
+            node = root
+            for p in parts[:-1]:
+                k = node.kids.get(p)
+                if k is None:
+                    k = Node(p)
+                    k.kids = {}
+                    node.kids[p] = k
+                elif k.kids is None:
+                    k.kids = {}
+                node = k
+            if parts:
+                k = node.kids.get(parts[-1])
+                if k is None:
+                    k = Node(parts[-1])
+                    node.kids[parts[-1]] = k
+                node = k
+            if (mode & S_IFMT) == S_IFDIR and node.kids is None:
+                node.kids = {}
+            node.meta = {'mode': mode, 'uid': uid, 'gid': gid, 'size': size,
+                         'mtime': mtime, 'nlink': nlink, 'stored': stored}
+            last = node
+            if not a.quiet and time.time() - tick > 1:
+                tick = time.time()
+                sys.stderr.write('\rmksysb2ncdu: %d files, %d MB' % (n, r.pos >> 20))
+    except FormatError as e:
+        warn(str(e))
+    if not a.quiet:
+        sys.stderr.write('\rmksysb2ncdu: %d files, %d MB read in %.0f s\n'
+                         % (n, r.pos >> 20, time.time() - t0))
+
+    out = sys.stdout.buffer if a.output == '-' else open(a.output, 'wb')
+    blk = max(1, a.block)
+
+    def dsz(m):
+        if a.dsize == 'archive':
+            return m['stored']
+        if a.dsize == 'apparent':
+            return m['size']
+        return (m['size'] + blk - 1) // blk * blk
+
+    def info(node, name):
+        m = node.meta
+        s = [b'{"name":', jstr(name)]
+        if m:
+            if node.kids is not None:
+                asz = m['size'] if m['size'] else 0
+                s.append(b',"asize":%d,"dsize":%d' % (asz, dsz(m) if a.dsize == 'archive' else 0))
+            else:
+                reg = (m['mode'] & S_IFMT) == S_IFREG
+                # symlink/FIFO/device: no data blocks on JFS2
+                ds = dsz(m) if reg or a.dsize == 'archive' else 0
+                s.append(b',"asize":%d,"dsize":%d' % (m['size'], ds))
+                if not reg:
+                    s.append(b',"notreg":true')
+            s.append(b',"uid":%d,"gid":%d,"mode":%d,"mtime":%d'
+                     % (m['uid'], m['gid'], m['mode'] & 0xffff, max(0, m['mtime'])))
+        s.append(b'}')
+        return b''.join(s)
+
+    w = out.write
+    w(b'[1,2,{"progname":"mksysb2ncdu","progver":"1.0","timestamp":%d},\n' % max(0, vdate))
+    # iterative (deep trees would hit the recursion limit)
+    rootname = (a.root or '/').encode()
+    stack = [(root, rootname, None)]
+    first = True
+    while stack:
+        node, name, it = stack.pop()
+        if it is None:
+            if not first:
+                w(b',\n')
+            first = False
+            if node.kids is None:
+                w(info(node, name))
+                continue
+            w(b'[' + info(node, name))
+            it = iter(sorted(node.kids.items()))
+        nxt = next(it, None)
+        if nxt is None:
+            w(b']')
+            continue
+        stack.append((node, name, it))
+        stack.append((nxt[1], nxt[0], None))
+        if nxt[1].kids is None:
+            # write leaves right away (saves iterations)
+            stack.pop()
+            w(b',\n' + info(nxt[1], nxt[0]))
+    w(b']\n')
+    out.flush()
+    if out is not sys.stdout.buffer:
+        out.close()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

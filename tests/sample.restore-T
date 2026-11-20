@@ -1,0 +1,12 @@
+           0 ./dir
+       44000 ./dir/packed.txt
+           0 ./dir/sub
+           5 ./dir/sub/deep.txt
+           0 ./empty
+           0 ./fifo
+           6 ./hl1
+           6 ./hl2
+           2 ./káša
+           2 ./q"uo\te
+           3 ./sym
+           2 ./with space
