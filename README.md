@@ -18,7 +18,10 @@ mksysb2ncdu host.mksysb | ncdu -r -f-
 - Runs on Linux and on AIX itself (`/usr/bin/python3`). Single file, Python 3 standard library only.
 - Reports apparent size, size rounded to JFS2 blocks, or the space each file takes **inside the
   mksysb** (after packing, with headers): `--dsize archive`.
-- Exports owner, group, mode and mtime too (shown in ncdu with `-e` / extended mode).
+- By default writes only sizes, like `ncdu -o` itself, so the export loads in ncdu 1.x (e.g. 1.20
+  from the AIX Toolbox). With `-e` it also exports owner, group, mode and mtime (shown in ncdu's
+  extended mode). uid/gid above 2147483647 (AIX `nobody` is 4294967294) are left out then,
+  ncdu 1.x rejects them with "Integer out of range".
 - Finds the start of the backup when something precedes it, e.g. a whole tape image copied into
   one file.
 
@@ -52,7 +55,7 @@ ncdu for AIX is available from the [AIX Toolbox](https://www.ibm.com/support/pag
 
 ```
 mksysb2ncdu [-h] [-o OUTPUT] [--dsize {block,archive,apparent}] [--block BLOCK]
-            [--root ROOT] [--scan MB] [-q] [file]
+            [--root ROOT] [--scan MB] [-e] [-q] [file]
 
   file                  mksysb file or - for stdin (default)
   -o, --output OUTPUT   output file (default stdout)
@@ -65,6 +68,9 @@ mksysb2ncdu [-h] [-o OUTPUT] [--dsize {block,archive,apparent}] [--block BLOCK]
   --root ROOT           name of the root directory shown in ncdu (default /)
   --scan MB             how many MB to search for the start of the backup
                         (tape image), default 256
+  -e, --extended        also export owner, group, mode and mtime (like ncdu -e);
+                        uid/gid above 2147483647 are left out, ncdu 1.x cannot
+                        read them
   -q, --quiet           no progress or warnings on stderr
 ```
 

@@ -33,6 +33,7 @@ FS_NAME_X, FS_NAME_LF, FS_NAME_ACL, FS_NAME_E = 11, 12, 14, 15
 NAME_TYPES = (FS_NAME_X, FS_NAME_LF, FS_NAME_E)
 S_IFMT, S_IFDIR, S_IFREG, S_IFLNK = 0o170000, 0o040000, 0o100000, 0o120000
 VOL_SIG = b'by name'
+INT32_MAX = 0x7fffffff
 
 
 class FormatError(Exception):
@@ -256,6 +257,9 @@ def main():
     ap.add_argument('--root', default=None, help='name of the root directory shown in ncdu (default /, e.g. /data for a savevg)')
     ap.add_argument('--scan', type=int, default=256, metavar='MB',
                     help='how many MB to search for the start of the backup (tape image), default 256')
+    ap.add_argument('-e', '--extended', action='store_true',
+                    help='also export owner, group, mode and mtime (like ncdu -e); '
+                         'uid/gid above 2147483647 are left out, ncdu 1.x cannot read them')
     ap.add_argument('-q', '--quiet', action='store_true', help='no progress or warnings on stderr')
     a = ap.parse_args()
 
@@ -347,8 +351,11 @@ def main():
                 s.append(b',"asize":%d,"dsize":%d' % (m['size'], ds))
                 if not reg:
                     s.append(b',"notreg":true')
-            s.append(b',"uid":%d,"gid":%d,"mode":%d,"mtime":%d'
-                     % (m['uid'], m['gid'], m['mode'] & 0xffff, max(0, m['mtime'])))
+            if a.extended:
+                for k in ('uid', 'gid'):
+                    if m[k] <= INT32_MAX:  # ncdu 1.x limit; e.g. AIX nobody is 4294967294
+                        s.append(b',"%s":%d' % (k.encode(), m[k]))
+                s.append(b',"mode":%d,"mtime":%d' % (m['mode'] & 0xffff, max(0, m['mtime'])))
         s.append(b'}')
         return b''.join(s)
 
